@@ -44,11 +44,13 @@ TARGET_LOUDNESS = "-23" # EBU R128 standard for broadcast is -23 LUFS.
 def check_dependencies():
     """Checks if required command-line tools are installed."""
     dependencies = ['ffmpeg', 'ffprobe', 'sox']
+    # Also require python3 for invoking the extractor
     for dep in dependencies:
         if not shutil.which(dep):
             print(f"Error: Required dependency '{dep}' not found in PATH.")
             print("Please install it and try again.")
             sys.exit(1)
+
 
 def run_command(command, description):
     """Runs a command, prints its description, and checks for errors."""
@@ -124,12 +126,53 @@ def detect_scenes(video_path):
         print(f"Error: Command 'ffmpeg' not found. Is it installed and in your PATH?")
         sys.exit(1)
 
+def ensure_clean_input(input_video_path: Path, output_folder_path: Path, force: bool = True) -> Path:
+    """Create and return a *_CLEAN.mp4 using the extractor script.
+
+    We do this to fix DVD-concatenation timestamp discontinuities so per-scene audio stays synced.
+    """
+    extractor_script = Path(__file__).with_name('extract_video_and_recombine_to_single_audio_track.py')
+    if not extractor_script.exists():
+        print(f"Error: extractor script not found: {extractor_script}")
+        sys.exit(1)
+
+    cleaned_dir = output_folder_path / "_clean"  # keep intermediates separate
+    cleaned_dir.mkdir(parents=True, exist_ok=True)
+
+    cleaned_path = cleaned_dir / f"{input_video_path.stem}_CLEAN.mp4"
+
+    if cleaned_path.exists() and not force:
+        print(f"Reusing existing cleaned file: {cleaned_path}")
+        return cleaned_path
+
+    print("--- Phase 0: Rebuilding a single synced audio track (CLEAN) ---")
+    cmd = [
+        sys.executable,
+        str(extractor_script),
+        "-i",
+        str(input_video_path),
+        "-o",
+        str(cleaned_dir),
+    ]
+    run_command(cmd, "creating CLEAN intermediate")
+
+    if not cleaned_path.exists():
+        # The extractor writes using the stem; double-check by glob.
+        candidates = list(cleaned_dir.glob(f"{input_video_path.stem}*_CLEAN.mp4"))
+        if candidates:
+            return candidates[0]
+        print(f"Error: CLEAN file was not created at expected path: {cleaned_path}")
+        sys.exit(1)
+
+    return cleaned_path
+
 def main():
     """Main script logic."""
     parser = argparse.ArgumentParser(
-        description="A Python script to enhance and split a video file into chapters based on scene changes.",
+        description="A Python script to enhance and split a video file into chapters based on scene changes.\n\n"
+                    "This script first generates a *_CLEAN.mp4 (single synced audio track) to prevent audio drift on DVD-concatenated MPEG files.",
         formatter_class=argparse.RawTextHelpFormatter,
-        epilog="Example:\npython enhance_video.py my_video.mp4 -o /home/admin/Desktop/Finished_Videos"
+        epilog="Example:\npython process_enhanced_chapters.py my_video.mpg -o /home/admin/Desktop/Finished_Videos"
     )
     parser.add_argument("input_video", help="Path to the input video file.")
     parser.add_argument(
@@ -137,33 +180,55 @@ def main():
         default=OUTPUT_FOLDER_DEFAULT,
         help=f"Path to the output folder. Defaults to '{OUTPUT_FOLDER_DEFAULT}'."
     )
+    parser.add_argument(
+        "--no-clean",
+        action="store_true",
+        help="Skip creating the *_CLEAN.mp4 intermediate (not recommended for DVD-concat MPEGs).",
+    )
+    parser.add_argument(
+        "--reuse-clean",
+        action="store_true",
+        help="Reuse an existing *_CLEAN.mp4 in <output>/_clean if present.",
+    )
     args = parser.parse_args()
 
     check_dependencies()
 
     input_video_path = Path(args.input_video)
     output_folder_path = Path(args.output_folder)
-    
+
     if not input_video_path.is_file():
         print(f"Error: Input file not found at '{input_video_path}'")
         sys.exit(1)
 
+    output_folder_path.mkdir(parents=True, exist_ok=True)
+
+    # --- Phase 0: CLEAN intermediate ---
+    if args.no_clean:
+        clean_input_path = input_video_path
+        print("WARNING: --no-clean specified; using original input for scene splitting.")
+    else:
+        clean_input_path = ensure_clean_input(
+            input_video_path,
+            output_folder_path,
+            force=not args.reuse_clean,
+        )
+
     # --- Script Logic Setup ---
-    basename = input_video_path.stem
+    basename = clean_input_path.stem
     temp_dir = output_folder_path / "temp_work"
     
-    output_folder_path.mkdir(parents=True, exist_ok=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"Starting enhancement process for: {input_video_path}")
+    print(f"Starting enhancement process for: {clean_input_path}")
     print(f"Output will be saved to: {output_folder_path}")
     
     try:
         # ==========================================
         # PHASE 1: SCENE DETECTION (IMPROVED)
         # ==========================================
-        total_duration = get_video_duration(input_video_path)
-        scene_times = detect_scenes(input_video_path)
+        total_duration = get_video_duration(clean_input_path)
+        scene_times = detect_scenes(clean_input_path)
 
         cuts = [0.0]
         last_cut = 0.0
@@ -222,7 +287,7 @@ def main():
                 'ffmpeg', '-v', 'error', '-stats',
                 '-ss', str(start_time),
                 '-t', str(duration),
-                '-i', str(input_video_path),
+                '-i', str(clean_input_path),
                 '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
                 str(temp_audio), '-y'
             ]
@@ -256,7 +321,7 @@ def main():
                 'ffmpeg', '-v', 'error', '-stats',
                 '-ss', str(start_time),
                 '-t', str(duration),
-                '-i', str(input_video_path),
+                '-i', str(clean_input_path),
                 '-i', str(enhanced_audio),
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
