@@ -23,11 +23,11 @@ from __future__ import annotations
 
 import argparse
 import base64
-import json
 import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -47,8 +47,8 @@ class FramePlan:
 DEFAULT_FRAME_PLAN = FramePlan(count=3, fractions=(0.10, 0.50, 0.90))
 
 
-def run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, check=check, text=True, capture_output=True)
+def run(cmd: list[str], *, check: bool = True, timeout_s: int | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, check=check, text=True, capture_output=True, timeout=timeout_s)
 
 
 def which_or_die(exe: str) -> None:
@@ -58,7 +58,7 @@ def which_or_die(exe: str) -> None:
         raise SystemExit(f"Missing dependency in PATH: {exe}")
 
 
-def ffprobe_duration_seconds(video: Path) -> float:
+def ffprobe_duration_seconds(video: Path, *, timeout_s: int = 30) -> float:
     p = run(
         [
             "ffprobe",
@@ -69,7 +69,8 @@ def ffprobe_duration_seconds(video: Path) -> float:
             "-of",
             "default=noprint_wrappers=1:nokey=1",
             str(video),
-        ]
+        ],
+        timeout_s=timeout_s,
     )
     try:
         return float(p.stdout.strip())
@@ -77,7 +78,14 @@ def ffprobe_duration_seconds(video: Path) -> float:
         raise RuntimeError(f"Failed to parse duration for {video}: {p.stdout!r}") from e
 
 
-def extract_frames(video: Path, out_dir: Path, plan: FramePlan) -> list[Path]:
+def extract_frames(
+    video: Path,
+    out_dir: Path,
+    plan: FramePlan,
+    *,
+    max_width: int = 640,
+    timeout_s: int = 60,
+) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     dur = ffprobe_duration_seconds(video)
 
@@ -85,30 +93,37 @@ def extract_frames(video: Path, out_dir: Path, plan: FramePlan) -> list[Path]:
     for i, frac in enumerate(plan.fractions[: plan.count], start=1):
         t = max(0.0, min(dur, dur * frac))
         out = out_dir / f"frame_{i:02d}.jpg"
-        # -ss before -i is fine for thumbnails; use -q:v for quality.
-        run([
-            "ffmpeg",
-            "-hide_banner",
-            "-v",
-            "error",
-            "-ss",
-            f"{t:.3f}",
-            "-i",
-            str(video),
-            "-frames:v",
-            "1",
-            "-q:v",
-            "2",
-            "-y",
-            str(out),
-        ])
+
+        # Downscale to reduce CPU + memory pressure for the later montage + VLM.
+        vf = f"scale='min({max_width},iw)':-2"
+
+        run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-v",
+                "error",
+                "-ss",
+                f"{t:.3f}",
+                "-i",
+                str(video),
+                "-frames:v",
+                "1",
+                "-vf",
+                vf,
+                "-q:v",
+                "3",
+                "-y",
+                str(out),
+            ],
+            timeout_s=timeout_s,
+        )
         frame_paths.append(out)
 
     return frame_paths
 
 
-def stitch_storyboard(frames: list[Path], storyboard_path: Path) -> None:
-    # 3x1 storyboard by default; use -tile 3x1.
+def stitch_storyboard(frames: list[Path], storyboard_path: Path, *, timeout_s: int = 30) -> None:
     cmd = [
         "montage",
         *[str(p) for p in frames],
@@ -118,7 +133,7 @@ def stitch_storyboard(frames: list[Path], storyboard_path: Path) -> None:
         "+0+0",
         str(storyboard_path),
     ]
-    run(cmd)
+    run(cmd, timeout_s=timeout_s)
 
 
 def to_filename_slug(text: str) -> str:
@@ -218,8 +233,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--work-dir",
-        default="_ai_caption_work",
-        help="Folder to store temporary frames/storyboards (default: _ai_caption_work).",
+        default=None,
+        help=(
+            "Folder to store temporary frames/storyboards. "
+            "Default prefers /mnt/homevideos/_ai_caption_work if available, otherwise ./_ai_caption_work."
+        ),
+    )
+    parser.add_argument(
+        "--allow-sd-temp",
+        action="store_true",
+        help="Allow temp work dir on the SD/root filesystem (not recommended).",
     )
     parser.add_argument(
         "--rename",
@@ -231,6 +254,41 @@ def main() -> None:
         action="store_true",
         help="Print actions but do not rename.",
     )
+    parser.add_argument(
+        "--max-width",
+        type=int,
+        default=640,
+        help="Downscale extracted frames to this max width (default: 640).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Process at most N files (0 = no limit).",
+    )
+    parser.add_argument(
+        "--skip-if-captioned",
+        action="store_true",
+        help="Skip files that already end with *_<slug>.mp4 (simple underscore heuristic).",
+    )
+    parser.add_argument(
+        "--ffprobe-timeout",
+        type=int,
+        default=30,
+        help="Timeout in seconds for ffprobe (default: 30).",
+    )
+    parser.add_argument(
+        "--ffmpeg-timeout",
+        type=int,
+        default=120,
+        help="Timeout in seconds for each ffmpeg thumbnail extraction (default: 120).",
+    )
+    parser.add_argument(
+        "--montage-timeout",
+        type=int,
+        default=60,
+        help="Timeout in seconds for montage (default: 60).",
+    )
 
     args = parser.parse_args()
 
@@ -238,32 +296,84 @@ def main() -> None:
     which_or_die("ffprobe")
     which_or_die("montage")
 
+    # Choose a safe default work dir: external drive if mounted.
+    if args.work_dir:
+        work_root = Path(args.work_dir)
+    else:
+        ext = Path("/mnt/homevideos")
+        work_root = (ext / "_ai_caption_work") if ext.is_dir() else Path("_ai_caption_work")
+
+    # Refuse to write temp work on the SD/root filesystem unless explicitly allowed.
+    if not args.allow_sd_temp:
+        try:
+            resolved = work_root.resolve()
+        except FileNotFoundError:
+            resolved = work_root.absolute()
+
+        # Heuristic: SD root is typically under / or /home; external drive under /mnt/homevideos.
+        if not str(resolved).startswith("/mnt/homevideos/"):
+            raise SystemExit(
+                f"Refusing to use temp work dir on SD/root filesystem: {resolved}\n"
+                "Pass --work-dir /mnt/homevideos/_ai_caption_work (recommended) or use --allow-sd-temp to override."
+            )
+
+    work_root.mkdir(parents=True, exist_ok=True)
+
     scene_files = iter_scene_files([Path(p) for p in args.inputs], args.glob)
     if not scene_files:
         raise SystemExit("No input files found.")
 
-    work_root = Path(args.work_dir)
-    work_root.mkdir(parents=True, exist_ok=True)
+    if args.limit and args.limit > 0:
+        scene_files = scene_files[: args.limit]
 
-    for scene in scene_files:
-        print(f"\n=== {scene} ===")
+    total = len(scene_files)
+    for idx, scene in enumerate(scene_files, start=1):
+        if args.skip_if_captioned and re.search(r"_[a-z0-9]{3,}(?:_[a-z0-9]{3,})+$", scene.stem):
+            print(f"[{idx}/{total}] SKIP (looks captioned): {scene.name}")
+            continue
+
+        print(f"\n[{idx}/{total}] === {scene} ===")
+        t0 = time.time()
+
         scene_work = work_root / to_filename_slug(scene.stem)
         frames_dir = scene_work / "frames"
         storyboard = scene_work / "storyboard.jpg"
 
-        frames = extract_frames(scene, frames_dir, DEFAULT_FRAME_PLAN)
-        stitch_storyboard(frames, storyboard)
+        try:
+            print("  - extracting frames...")
+            frames = extract_frames(
+                scene,
+                frames_dir,
+                DEFAULT_FRAME_PLAN,
+                max_width=args.max_width,
+                timeout_s=args.ffmpeg_timeout,
+            )
 
-        caption = ollama_generate_caption(
-            storyboard,
-            model=args.model,
-            prompt=args.prompt,
-            ollama_url=args.ollama_url,
-            timeout_s=args.timeout,
-        )
+            print("  - stitching storyboard...")
+            stitch_storyboard(frames, storyboard, timeout_s=args.montage_timeout)
+
+            print("  - querying ollama...")
+            caption = ollama_generate_caption(
+                storyboard,
+                model=args.model,
+                prompt=args.prompt,
+                ollama_url=args.ollama_url,
+                timeout_s=args.timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            print(f"  ERROR: timed out while running: {' '.join(e.cmd)}")
+            continue
+        except subprocess.CalledProcessError as e:
+            show = (e.stderr or e.stdout or "").strip()
+            print(f"  ERROR: command failed: {' '.join(e.cmd)}")
+            if show:
+                print(f"  OUTPUT: {show[-500:]}")
+            continue
+
         slug = to_filename_slug(caption)
         print(f"Caption: {caption}")
         print(f"Slug:    {slug}")
+        print(f"Done in: {time.time() - t0:.1f}s")
 
         if args.rename:
             new_name = f"{scene.stem}_{slug}{scene.suffix}"
